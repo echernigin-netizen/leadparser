@@ -215,7 +215,11 @@ async def process_chat(client, matcher, raw_chat, state, me_id, deliver):
     Возвращает кол-во доставленных заявок. Ошибки одного чата не валят прогон.
     """
     try:
-        entity = await client.get_entity(raw_chat)
+        # В авто-режиме сюда уже приходит готовая сущность; иначе — строка/id.
+        if isinstance(raw_chat, (str, int)):
+            entity = await client.get_entity(raw_chat)
+        else:
+            entity = raw_chat
     except Exception as e:
         log(f"[SKIP] {raw_chat}: не удалось получить чат ({e})")
         return 0
@@ -306,13 +310,20 @@ async def run():
 
     delivery_mode = (env("DELIVERY_MODE", "channel") or "channel").strip().lower()
 
+    # Авто-режим: если AUTO_DISCOVER включён — игнорируем chats.txt и читаем
+    # ВСЕ группы/супергруппы, в которых состоит аккаунт-парсер. Вступил в новый
+    # чат — он сам попадёт в обработку, файл редактировать не нужно.
+    auto_discover = (env("AUTO_DISCOVER", "") or "").strip().lower() in (
+        "1", "true", "yes", "on", "auto"
+    )
+
     keywords = load_json(KEYWORDS_PATH, {})
     matcher = Matcher(keywords)
-    chats = read_chats(CHATS_PATH)
     state = load_json(STATE_PATH, {})
 
-    if not chats:
-        log("[INFO] chats.txt пуст — добавь чаты. Выхожу.")
+    manual_chats = read_chats(CHATS_PATH)
+    if not auto_discover and not manual_chats:
+        log("[INFO] chats.txt пуст и AUTO_DISCOVER выключен — нечего читать. Выхожу.")
         return
 
     client = TelegramClient(StringSession(string_session), api_id, api_hash)
@@ -323,7 +334,35 @@ async def run():
 
     me = await client.get_me()
     me_id = me.id
-    log(f"[INFO] парсер: @{me.username} id={me_id}, режим доставки={delivery_mode}, чатов={len(chats)}")
+
+    # Какой id у канала доставки — чтобы НЕ читать его в авто-режиме
+    # (иначе парсер начнёт перечитывать собственные карточки).
+    target_id = None
+    if delivery_mode != "bot":
+        try:
+            target_id = int(env("TARGET_CHAT", "") or 0)
+        except (TypeError, ValueError):
+            target_id = None
+
+    if auto_discover:
+        chats = []
+        async for d in client.iter_dialogs():
+            if not getattr(d, "is_group", False):
+                continue  # только группы/супергруппы (broadcast-каналы пропускаем)
+            if target_id and d.id == target_id:
+                continue  # не читаем канал, куда сами постим
+            chats.append(d.entity)
+        log(f"[INFO] авто-режим: найдено групп {len(chats)}")
+    else:
+        chats = manual_chats
+
+    if not chats:
+        log("[INFO] подходящих чатов не найдено — выхожу.")
+        await client.disconnect()
+        return
+
+    log(f"[INFO] парсер: @{me.username} id={me_id}, доставка={delivery_mode}, "
+        f"авто={auto_discover}, чатов={len(chats)}")
 
     # Готовим функцию доставки один раз.
     if delivery_mode == "bot":
