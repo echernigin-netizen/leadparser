@@ -352,7 +352,9 @@ async def run():
             if target_id and d.id == target_id:
                 continue  # не читаем канал, куда сами постим
             chats.append(d.entity)
-        log(f"[INFO] авто-режим: найдено групп {len(chats)}")
+        log(f"[INFO] авто-режим: найдено групп {len(chats)}:")
+        for ent in chats:
+            log(f"    - {chat_title(ent)} (id {getattr(ent, 'id', '?')})")
     else:
         chats = manual_chats
 
