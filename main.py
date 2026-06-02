@@ -97,6 +97,14 @@ def normalize(text):
 
 # --------------------------- Фильтрация ---------------------------
 
+# Слова текста = последовательности букв/цифр (учитывая кириллицу).
+_TOKEN_RE = re.compile(r"[a-zа-яё0-9]+")
+
+
+def tokenize(norm_text):
+    return _TOKEN_RE.findall(norm_text)
+
+
 class Matcher:
     def __init__(self, keywords):
         self.intent = [normalize(w) for w in keywords.get("intent", [])]
@@ -105,6 +113,21 @@ class Matcher:
             niche: [normalize(w) for w in words]
             for niche, words in keywords.get("niches", {}).items()
         }
+
+    @staticmethod
+    def _hit(keyword, norm, tokens):
+        """
+        Совпадение по границе слова, а не по подстроке.
+        - фраза (есть пробел): ищем как подстроку (фразы достаточно специфичны);
+        - одно слово: слово в тексте должно НАЧИНАТЬСЯ с ключа (ловим словоформы:
+          «продаж» → «продажи», но «ии» уже не ловит «России»/«акции»).
+        """
+        if " " in keyword:
+            return keyword in norm
+        return any(tok.startswith(keyword) for tok in tokens)
+
+    def _any(self, words, norm, tokens):
+        return any(self._hit(w, norm, tokens) for w in words)
 
     def match(self, text):
         """
@@ -115,14 +138,16 @@ class Matcher:
         if len(norm) < MIN_MESSAGE_LEN:
             return None
 
-        if any(neg in norm for neg in self.negative):
+        tokens = tokenize(norm)
+
+        if self._any(self.negative, norm, tokens):
             return None
 
-        if not any(intent in norm for intent in self.intent):
+        if not self._any(self.intent, norm, tokens):
             return None
 
         for niche, words in self.niches.items():
-            if any(w in norm for w in words):
+            if self._any(words, norm, tokens):
                 return niche
 
         return None
