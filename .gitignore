@@ -1,0 +1,6 @@
+# Никаких сессий и секретов в репозитории!
+*.session
+*.session-journal
+.env
+__pycache__/
+*.pyc
