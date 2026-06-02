@@ -313,7 +313,7 @@ async def run():
     # Авто-режим: если AUTO_DISCOVER включён — игнорируем chats.txt и читаем
     # ВСЕ группы/супергруппы, в которых состоит аккаунт-парсер. Вступил в новый
     # чат — он сам попадёт в обработку, файл редактировать не нужно.
-    auto_discover = (env("AUTO_DISCOVER", "") or "").strip().lower() in (
+    auto_flag = (env("AUTO_DISCOVER", "") or "").strip().lower() in (
         "1", "true", "yes", "on", "auto"
     )
 
@@ -322,9 +322,8 @@ async def run():
     state = load_json(STATE_PATH, {})
 
     manual_chats = read_chats(CHATS_PATH)
-    if not auto_discover and not manual_chats:
-        log("[INFO] chats.txt пуст и AUTO_DISCOVER выключен — нечего читать. Выхожу.")
-        return
+    # Авто-режим включается явным флагом AUTO_DISCOVER ИЛИ когда chats.txt пуст.
+    auto_discover = auto_flag or not manual_chats
 
     client = TelegramClient(StringSession(string_session), api_id, api_hash)
     await client.connect()
