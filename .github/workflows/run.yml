@@ -44,10 +44,16 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- state.json; then
-            git add state.json
-            git commit -m "chore: update state [skip ci]"
-            git push
-          else
+          if git diff --quiet -- state.json; then
             echo "state.json без изменений"
+            exit 0
           fi
+          git add state.json
+          git commit -m "chore: update state [skip ci]"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin main && git push && exit 0
+            echo "push не прошёл, попытка $i..."
+            sleep 3
+          done
+          echo "не смог сохранить state" >&2
+          exit 1
