@@ -15,9 +15,11 @@ import re
 import sys
 import json
 import time
+import hashlib
 import asyncio
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone, timedelta
 
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -41,12 +43,37 @@ MIN_MESSAGE_LEN = 15
 # Обрезка текста в карточке.
 MAX_CARD_TEXT = 600
 
+# Московский часовой пояс — по нему считаем «сегодня».
+MSK = timezone(timedelta(hours=3))
+
+# Отсечка по дате: доставляем только свежее.
+#   ROLLING_HOURS = 0  → только за сегодня (с полуночи МСК);
+#   ROLLING_HOURS > 0  → скользящее окно последних N часов (напр. 24).
+ROLLING_HOURS = 0
+
+# Сколько хэшей уже отправленных заявок помнить (защита от повторов/перепостов).
+SEEN_LIMIT = 5000
+
 # Эмодзи-тег по нише.
 NICHE_EMOJI = {
     "Продажи": "🟢",
     "Маркетинг": "🔵",
     "ИИ": "🟣",
 }
+
+
+def delivery_cutoff():
+    """Граница свежести: раньше неё ничего не доставляем (см. ROLLING_HOURS)."""
+    now = datetime.now(MSK)
+    if ROLLING_HOURS > 0:
+        return now - timedelta(hours=ROLLING_HOURS)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def content_fingerprint(text):
+    """Отпечаток сообщения по нормализованному тексту — чтобы один и тот же
+    текст (хоть перепост того же автора, хоть копипаст другого) не ушёл дважды."""
+    return hashlib.sha1(normalize(text).encode("utf-8")).hexdigest()[:16]
 
 
 def env(name, default=None, required=False):
@@ -74,6 +101,30 @@ def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
+
+
+def load_state(path):
+    """
+    Возвращает (watermarks, seen):
+      watermarks — {chat_id: last_msg_id} (дедуп по id внутри чата);
+      seen       — ordered-set (dict) хэшей уже отправленных заявок (дедуп по тексту).
+    Понимает и старый плоский формат {chat_id: last_id}.
+    """
+    raw = load_json(path, {})
+    if "watermarks" in raw or "seen" in raw:
+        watermarks = raw.get("watermarks", {})
+        seen_list = raw.get("seen", [])
+    else:
+        watermarks = raw          # старый формат — это и есть watermarks
+        seen_list = []
+    return watermarks, dict.fromkeys(seen_list)
+
+
+def save_state(path, watermarks, seen):
+    save_json(path, {
+        "watermarks": watermarks,
+        "seen": list(seen)[-SEEN_LIMIT:],   # помним только последние SEEN_LIMIT
+    })
 
 
 def read_chats(path):
@@ -234,10 +285,14 @@ def chat_title(entity):
 
 # --------------------------- Главный цикл ---------------------------
 
-async def process_chat(client, matcher, raw_chat, state, me_id, deliver):
+async def process_chat(client, matcher, raw_chat, state, me_id, deliver, seen, cutoff):
     """
     Обрабатывает один чат: забирает новые сообщения, фильтрует, доставляет.
     Возвращает кол-во доставленных заявок. Ошибки одного чата не валят прогон.
+
+    seen   — ordered-set (dict) хэшей уже отправленных заявок: один и тот же
+             текст не уходит повторно, даже если у него новый message id.
+    cutoff — datetime: сообщения старше неё не доставляем (только свежее).
     """
     try:
         # В авто-режиме сюда уже приходит готовая сущность; иначе — строка/id.
@@ -253,13 +308,18 @@ async def process_chat(client, matcher, raw_chat, state, me_id, deliver):
     last_id = int(state.get(key, 0))
     title = chat_title(entity)
 
-    # Собираем новые сообщения (id > last_id), от старых к новым.
+    # Собираем новые сообщения (id > last_id) сразу в хронологическом порядке.
+    # reverse=True отдаёт от старых к новым и режет лимит со стороны СТАРЫХ:
+    # при бэклоге > MAX_MESSAGES_PER_CHAT берём самые старые непрочитанные и
+    # двигаем водяной знак на них, остаток дочитаем в следующих прогонах — без дыр.
+    # (newest-first + limit терял бы самые старые сообщения навсегда.)
     new_messages = []
     try:
         async for msg in client.iter_messages(
             entity,
             limit=MAX_MESSAGES_PER_CHAT,
             min_id=last_id,
+            reverse=True,
         ):
             new_messages.append(msg)
     except FloodWaitError as e:
@@ -272,8 +332,6 @@ async def process_chat(client, matcher, raw_chat, state, me_id, deliver):
     if not new_messages:
         return 0
 
-    new_messages.reverse()  # хронологический порядок
-
     delivered = 0
     max_seen = last_id
 
@@ -285,12 +343,22 @@ async def process_chat(client, matcher, raw_chat, state, me_id, deliver):
         if not text:
             continue
 
+        # старое не доставляем — только свежее (см. delivery_cutoff)
+        if cutoff and msg.date and msg.date < cutoff:
+            continue
+
         # игнор собственных сообщений парсера
         if getattr(msg, "sender_id", None) == me_id:
             continue
 
         niche = matcher.match(text)
         if not niche:
+            continue
+
+        # дедуп по содержимому: тот же текст уже отправляли — пропускаем,
+        # даже если это перепост с новым message id
+        fp = content_fingerprint(text)
+        if fp in seen:
             continue
 
         try:
@@ -310,12 +378,14 @@ async def process_chat(client, matcher, raw_chat, state, me_id, deliver):
 
         try:
             await deliver(card)
+            seen[fp] = None      # запоминаем только после успешной отправки
             delivered += 1
         except FloodWaitError as e:
             log(f"[FLOOD] доставка: ждать {e.seconds}s")
             await asyncio.sleep(min(e.seconds, 60))
             try:
                 await deliver(card)
+                seen[fp] = None
                 delivered += 1
             except Exception as e2:
                 log(f"[ERR] повторная доставка не удалась: {e2}")
@@ -344,7 +414,8 @@ async def run():
 
     keywords = load_json(KEYWORDS_PATH, {})
     matcher = Matcher(keywords)
-    state = load_json(STATE_PATH, {})
+    watermarks, seen = load_state(STATE_PATH)
+    cutoff = delivery_cutoff()
 
     manual_chats = read_chats(CHATS_PATH)
     # Авто-режим включается явным флагом AUTO_DISCOVER ИЛИ когда chats.txt пуст.
@@ -409,14 +480,18 @@ async def run():
         async def deliver(card):
             await deliver_via_channel(client, target_chat, card)
 
+    log(f"[INFO] отсечка по дате: доставляю от {cutoff:%Y-%m-%d %H:%M} МСК и новее")
+
     total = 0
     try:
         for raw_chat in chats:
-            total += await process_chat(client, matcher, raw_chat, state, me_id, deliver)
+            total += await process_chat(
+                client, matcher, raw_chat, watermarks, me_id, deliver, seen, cutoff
+            )
             await asyncio.sleep(1)  # лёгкая пауза между чатами
     finally:
         await client.disconnect()
-        save_json(STATE_PATH, state)
+        save_state(STATE_PATH, watermarks, seen)
 
     log(f"[DONE] всего доставлено заявок: {total}")
 
