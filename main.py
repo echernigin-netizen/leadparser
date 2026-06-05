@@ -49,7 +49,7 @@ MSK = timezone(timedelta(hours=3))
 # Отсечка по дате: доставляем только свежее.
 #   ROLLING_HOURS = 0  → только за сегодня (с полуночи МСК);
 #   ROLLING_HOURS > 0  → скользящее окно последних N часов (напр. 24).
-ROLLING_HOURS = 0
+ROLLING_HOURS = 48
 
 # Сколько хэшей уже отправленных заявок помнить (защита от повторов/перепостов).
 SEEN_LIMIT = 5000
@@ -285,6 +285,25 @@ def chat_title(entity):
 
 # --------------------------- Главный цикл ---------------------------
 
+async def cutoff_floor_id(client, entity, cutoff):
+    """
+    id новейшего сообщения СТАРШЕ cutoff — нижняя граница, ниже которой читать
+    бессмысленно: это старьё мы всё равно не доставляем (см. delivery_cutoff).
+
+    Зачем: без неё новый чат (watermark=0) или сильно отставший начинает читать
+    с начала истории и бесконечно жуёт бэклог, который целиком режется отсечкой
+    по дате — до свежих сообщений дело не доходит, заявки не приходят.
+
+    Возвращает 0, если в чате нет сообщений старше cutoff (тогда читаем всё).
+    """
+    if not cutoff:
+        return 0
+    # offset_date отдаёт сообщения старше указанной даты, новейшее — первым.
+    async for m in client.iter_messages(entity, offset_date=cutoff, limit=1):
+        return m.id
+    return 0
+
+
 async def process_chat(client, matcher, raw_chat, state, me_id, deliver, seen, cutoff):
     """
     Обрабатывает один чат: забирает новые сообщения, фильтрует, доставляет.
@@ -305,8 +324,22 @@ async def process_chat(client, matcher, raw_chat, state, me_id, deliver, seen, c
         return 0
 
     key = str(getattr(entity, "id", raw_chat))
-    last_id = int(state.get(key, 0))
     title = chat_title(entity)
+    stored_id = int(state.get(key, 0))
+
+    # Не вычитываем старьё: поднимаем нижнюю границу до окна доставки. Иначе
+    # новый чат (watermark=0) или сильно отставший начинает с начала истории и
+    # месяцами жуёт бэклог, целиком режущийся отсечкой по дате, — заявки не идут.
+    # Все сообщения с id <= floor старше cutoff (id в чате растёт со временем),
+    # так что пропускаем их безопасно. max() гарантирует, что watermark не откатится.
+    try:
+        floor_id = await cutoff_floor_id(client, entity, cutoff)
+    except FloodWaitError as e:
+        log(f"[FLOOD] {title}: ждать {e.seconds}s — пропускаю чат в этом прогоне")
+        return 0
+    except Exception:
+        floor_id = 0
+    last_id = max(stored_id, floor_id)
 
     # Собираем новые сообщения (id > last_id) сразу в хронологическом порядке.
     # reverse=True отдаёт от старых к новым и режет лимит со стороны СТАРЫХ:
